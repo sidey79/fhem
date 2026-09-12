@@ -24,7 +24,7 @@ sub KLF200_Initialize($) {
   $hash->{ShutdownFn} = "KLF200_Shutdown";
   $hash->{ReadyFn}    = "KLF200_Ready";
   $hash->{WriteFn}    = "KLF200_Write";
-  $hash->{AttrList}   = "autoReboot:0,1 velocity:DEFAULT,SILENT,FAST controlNames priorityLevel:5,3,2 " . $readingFnAttributes;
+  $hash->{AttrList}   = "autoReboot:0,1 velocity:DEFAULT,SILENT,FAST controlNames priorityLevel:5,3,2 keepAliveInterval " . $readingFnAttributes;
   
   $hash->{parseParams}  = 1;
   $hash->{Clients} = "KLF200Node.*";
@@ -194,7 +194,6 @@ sub KLF200_Read($) {
   # stop processing if no data is available (device disconnected)
   return if(!defined($buf));
   
-  RemoveInternalTimer($hash, "KLF200_connectionBroken"); #clear watchdog to check if connection is broken
   readingsBeginUpdate($hash);
   readingsBulkUpdateIfChanged($hash, "connectionBroken", 0, 1);
   readingsEndUpdate($hash, 1);
@@ -465,10 +464,20 @@ sub KLF200_WriteDirect($$) {
   $bytes = KLF200_WrapBytes($hash, $bytes);
   
   DevIo_SimpleWrite($hash, $bytes, 0);
+  return;
+}
+
+#The keep alive is a fixed cycle, not rescheduled on every write: a stuck queue
+#stops writing, and that is exactly when the connection has to be probed.
+sub KLF200_StartKeepAlive($) {
+  my ($hash) = @_;
+  my $name = $hash->{NAME};
 
   RemoveInternalTimer($hash, "KLF200_GW_GET_STATE_REQ");
-  InternalTimer( gettimeofday() + 600, "KLF200_GW_GET_STATE_REQ", $hash); #call after 10 minutes to keep alive
-  InternalTimer( gettimeofday() + 5, "KLF200_connectionBroken", $hash); #the box answers in 1s, assume after 5s the connection is broken
+  my $interval = AttrVal($name, "keepAliveInterval", 60);
+  if (($interval !~ /^\d+$/) or ($interval == 0)) { return };
+  $interval = 10 if ($interval < 10);
+  InternalTimer( gettimeofday() + $interval, "KLF200_GW_GET_STATE_REQ", $hash);
   return;
 }
 
@@ -720,6 +729,7 @@ sub KLF200_connectionBroken($) {
   #power cycle helps.
   KLF200_GW_HOUSE_STATUS_MONITOR_DISABLE_REQ($hash, 0);
 
+  RemoveInternalTimer($hash, "KLF200_GW_GET_STATE_REQ");
   RemoveInternalTimer($hash, "KLF200_QueueTimeout");
   DevIo_CloseDev($hash);
   $hash->{PARTIAL} = "";
@@ -764,6 +774,9 @@ sub KLF200_GW_PASSWORD_ENTER_CFM($$) {
   readingsBulkUpdate($hash, "state", "Logged in", 1);
   readingsEndUpdate($hash, 1);
   
+  #Start the keep alive cycle as soon as there is a session
+  KLF200_StartKeepAlive($hash);
+
   #First run the queue to be responsive
   KLF200_RunQueue($hash);
   if (($connectionsAfterBoot > 1) and (AttrVal($name, "autoReboot", 1) == 1)) {
@@ -852,6 +865,13 @@ sub KLF200_GW_GET_STATE_REQ($) {
   
   Log3($hash, 5, "KLF200 ($name) GW_GET_STATE_REQ");
   KLF200_WriteDirect($hash, $Command);
+
+  #The box answers within about a second. The watchdog is deliberately bound to
+  #the keep alive only: it used to be reset by every incoming byte, so a stream
+  #of unsolicited notifications kept a dead session alive forever.
+  RemoveInternalTimer($hash, "KLF200_connectionBroken");
+  InternalTimer( gettimeofday() + 5, "KLF200_connectionBroken", $hash);
+  KLF200_StartKeepAlive($hash);
   return;
 }
 
@@ -861,6 +881,7 @@ sub KLF200_GW_GET_STATE_CFM($$) {
   my ($commandHex, $GatewayState, $SubState, $StateData) = unpack("H4 C C n", $bytes);
   Log3($hash, 5, "KLF200 ($name) GW_GET_STATE_CFM $commandHex $GatewayState $SubState $StateData");
 
+  RemoveInternalTimer($hash, "KLF200_connectionBroken");
   if (($GatewayState == 2) or ($GatewayState == 1)) {
     my $SubStateStr = KLF200_GetText($hash, "SubState", $SubState);
     readingsSingleUpdate($hash, "subState", $SubStateStr, 1);
@@ -1107,6 +1128,8 @@ sub KLF200_GW_REBOOT_CFM($$) {
   my ($commandHex) = unpack("H4", $bytes);
   Log3($hash, 5, "KLF200 ($name) GW_REBOOT_CFM $commandHex");
 
+  RemoveInternalTimer($hash, "KLF200_GW_GET_STATE_REQ");
+  RemoveInternalTimer($hash, "KLF200_connectionBroken");
   RemoveInternalTimer($hash, "KLF200_QueueTimeout");
   DevIo_CloseDev($hash);  
   $hash->{PARTIAL} = "";
@@ -1266,6 +1289,14 @@ sub KLF200_GW_ERROR_NTF($$) {
         If the connection was broken a socket is unusable in most cases. So a reboot ensures that always a second socket is available.<br>
         The house status monitor is now disabled before the socket is closed, which is one reason for unusable sockets.
         If your connection turns out to be stable you can try to switch this off.<br>
+        <br>
+    </li>
+    <a name="keepAliveInterval"></a>
+    <li>keepAliveInterval<br>
+        Interval in seconds for the keep alive request (<code>GW_GET_STATE_REQ</code>) sent to the box, default is 60.
+        0 switches the keep alive off, values below 10 are raised to 10.<br>
+        The box has to answer within 5 seconds, otherwise the connection is treated as broken and is reestablished.
+        A changed value takes effect with the next keep alive cycle.<br>
         <br>
     </li>
     <a name="prorityLevel"></a>
