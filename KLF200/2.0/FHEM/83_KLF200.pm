@@ -475,7 +475,12 @@ sub KLF200_StartKeepAlive($) {
 
   RemoveInternalTimer($hash, "KLF200_GW_GET_STATE_REQ");
   my $interval = AttrVal($name, "keepAliveInterval", 60);
-  if (($interval !~ /^\d+$/) or ($interval == 0)) { return };
+  if ($interval !~ /^\d+$/) {
+    #An invalid value must not silently switch the keep alive off
+    Log3($hash, 1, "KLF200 ($name) Invalid keepAliveInterval '$interval', falling back to 60 seconds");
+    $interval = 60;
+  }
+  if ($interval == 0) { return }; #explicitly switched off
   $interval = 10 if ($interval < 10);
   InternalTimer( gettimeofday() + $interval, "KLF200_GW_GET_STATE_REQ", $hash);
   return;

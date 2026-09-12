@@ -4,12 +4,12 @@
 package main;
 use strict;
 use warnings;
-use Test::More tests => 6;
+use Test::More tests => 9;
 use FindBin;
 use lib "$FindBin::Bin/stub";
 
 require "$FindBin::Bin/fhem_stub.pl";
-our (%READINGS, @TIMERS, @WRITTEN, @LOG, @READ_CHUNKS, %defs);
+our (%READINGS, @TIMERS, @WRITTEN, @LOG, @READ_CHUNKS, %defs, %attr);
 
 my $module = "$FindBin::Bin/../FHEM/83_KLF200.pm";
 do $module;
@@ -82,3 +82,20 @@ KLF200_Write($hash, "\x03\x00" . pack("n",1));         # GW_COMMAND_SEND_REQ
 FireTimer($hash,"KLF200_QueueTimeout");
 is(scalar(@main::WRITTEN), 1, "movement command is not repeated");
 is(scalar(@{$hash->{".queue"}}), 0, "movement command is dropped and the queue continues");
+
+# ---------------------------------------------------------------- 15. keep alive interval
+$hash = new_hash();
+KLF200_StartKeepAlive($hash);
+is(HasTimer($hash,"KLF200_GW_GET_STATE_REQ"), 1, "keep alive is armed with the default interval");
+
+$hash = new_hash();
+$main::attr{KLF}{keepAliveInterval} = "?";
+KLF200_StartKeepAlive($hash);
+is(HasTimer($hash,"KLF200_GW_GET_STATE_REQ"), 1,
+   "an invalid interval falls back to the default instead of switching the keep alive off");
+
+$hash = new_hash();
+$main::attr{KLF}{keepAliveInterval} = 0;
+KLF200_StartKeepAlive($hash);
+is(HasTimer($hash,"KLF200_GW_GET_STATE_REQ"), 0, "0 switches the keep alive off");
+delete $main::attr{KLF};
