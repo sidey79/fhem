@@ -73,7 +73,10 @@ sub KLF200_Shutdown($) {
 	my $name = $hash->{NAME};
 
 	if(DevIo_IsOpen($hash)) {
-	  # leave the box in a healthy state
+	  # leave the box in a healthy state:
+	  # the house status monitor has to be disabled before the socket is closed,
+	  # otherwise the next SSL handshake fails and the box needs a power cycle
+	  KLF200_GW_HOUSE_STATUS_MONITOR_DISABLE_REQ($hash, 0);
 	  KLF200_GW_REBOOT_REQ($hash, 0) if(AttrVal($name, "autoReboot", 1) == 1);
 	  # close the connection 
 	  DevIo_CloseDev($hash);
@@ -248,6 +251,7 @@ sub KLF200_DispatchFrame($$) {
   elsif ($command eq "\x30\x01") { KLF200_GW_PASSWORD_ENTER_CFM($hash, $bytes) }
   elsif ($command eq "\x20\x01") { KLF200_GW_SET_UTC_CFM($hash, $bytes) }
   elsif ($command eq "\x02\x41") { KLF200_GW_HOUSE_STATUS_MONITOR_ENABLE_CFM($hash, $bytes) }
+  elsif ($command eq "\x02\x43") { KLF200_GW_HOUSE_STATUS_MONITOR_DISABLE_CFM($hash, $bytes) }
   elsif ($command eq "\x02\x05") { KLF200_GW_GET_ALL_NODES_INFORMATION_FINISHED_NTF($hash, $bytes) }
   elsif ($command eq "\x00\x09") { KLF200_GW_GET_VERSION_CFM($hash, $bytes) }
   elsif ($command eq "\x04\x13") { KLF200_GW_ACTIVATE_SCENE_CFM($hash, $bytes) }
@@ -341,6 +345,9 @@ sub KLF200_UpdateAll($) {
     KLF200_GW_GET_ALL_NODES_INFORMATION_REQ($hash);
     KLF200_GW_CS_GET_SYSTEMTABLE_DATA_REQ($hash);
     KLF200_GW_GET_VERSION_REQ($hash);
+    #Cycle the house status monitor: after an unclean disconnect the box can be
+    #left with a stale monitor, so disable it before enabling it again.
+    KLF200_GW_HOUSE_STATUS_MONITOR_DISABLE_REQ($hash, 1);
     KLF200_GW_HOUSE_STATUS_MONITOR_ENABLE_REQ($hash);
     return; 
 }
@@ -640,6 +647,11 @@ sub KLF200_connectionBroken($) {
   
   if (ReadingsVal($name, "connectionBroken", 0) == 1) { return; };
   
+  #Try to leave the box in a reconnectable state: if the socket is closed while
+  #the house status monitor is enabled, the next SSL handshake fails and only a
+  #power cycle helps.
+  KLF200_GW_HOUSE_STATUS_MONITOR_DISABLE_REQ($hash, 0);
+
   DevIo_CloseDev($hash);
   $hash->{PARTIAL} = "";
   Log3($hash, 1, "KLF200 ($name) - connectionBroken -> closed connection");
@@ -738,6 +750,28 @@ sub KLF200_GW_HOUSE_STATUS_MONITOR_ENABLE_CFM($$) {
   Log3($hash, 5, "KLF200 ($name) GW_HOUSE_STATUS_MONITOR_ENABLE_CFM $commandHex");
 
   KLF200_Dequeue($hash, qr/^\x02\x40/, undef); #GW_HOUSE_STATUS_MONITOR_ENABLE_REQ
+  return;
+}
+
+sub KLF200_GW_HOUSE_STATUS_MONITOR_DISABLE_REQ($$) {
+  my ($hash, $queued) = @_;
+  my $name = $hash->{NAME};
+  
+  my $Command = "\x02\x42";
+
+  Log3($hash, 5, "KLF200 ($name) GW_HOUSE_STATUS_MONITOR_DISABLE_REQ");
+  if($queued) { KLF200_Write($hash, $Command); }
+  else        { KLF200_WriteDirect($hash, $Command); };
+  return;
+}
+
+sub KLF200_GW_HOUSE_STATUS_MONITOR_DISABLE_CFM($$) {
+  my ($hash, $bytes) = @_;
+  my $name = $hash->{NAME};
+  my ($commandHex) = unpack("H4", $bytes);
+  Log3($hash, 5, "KLF200 ($name) GW_HOUSE_STATUS_MONITOR_DISABLE_CFM $commandHex");
+
+  KLF200_Dequeue($hash, qr/^\x02\x42/, undef); #GW_HOUSE_STATUS_MONITOR_DISABLE_REQ
   return;
 }
 
@@ -1165,6 +1199,8 @@ sub KLF200_GW_ERROR_NTF($$) {
         Values can be 0 for off and 1 for on, default is on.<br>
         Reboot the KLF200 box if connection was lost. Reason: The KLF200 box supports only two TCP sockets.
         If the connection was broken a socket is unusable in most cases. So a reboot ensures that always a second socket is available.<br>
+        The house status monitor is now disabled before the socket is closed, which is one reason for unusable sockets.
+        If your connection turns out to be stable you can try to switch this off.<br>
         <br>
     </li>
     <a name="prorityLevel"></a>
