@@ -55,6 +55,7 @@ sub KLF200_Define($$) {
   $hash->{".sceneIDUsage"} = "";
   $hash->{".sceneToID"} = {};
   $hash->{".queue"} = [];
+  $hash->{PARTIAL} = "";
   
   # close connection if maybe open (on definition modify)
   DevIo_CloseDev($hash) if(DevIo_IsOpen($hash));  
@@ -78,6 +79,7 @@ sub KLF200_Shutdown($) {
 	  DevIo_CloseDev($hash);
 	}
 	RemoveInternalTimer($hash);    
+	$hash->{PARTIAL} = "";
 	return undef;
 }
 
@@ -178,6 +180,7 @@ sub KLF200_Ready($) {
 }
 
 # called when data was received
+# called when data was received
 sub KLF200_Read($) {
   my ($hash) = @_;
   my $name = $hash->{NAME};
@@ -193,9 +196,50 @@ sub KLF200_Read($) {
   readingsBulkUpdateIfChanged($hash, "connectionBroken", 0, 1);
   readingsEndUpdate($hash, 1);
 
-  my $bytes = KLF200_UnwrapBytes($hash, $buf);
-  return if(!defined($bytes));
-  
+  # TCP is a byte stream, not a message channel: one read can carry a partial
+  # frame, exactly one frame or several frames. Collect everything in PARTIAL
+  # and cut out each complete SLIP frame, keep the remainder for the next read.
+  $hash->{PARTIAL} = "" if(not defined($hash->{PARTIAL}));
+  $hash->{PARTIAL} .= $buf;
+
+  if (length($hash->{PARTIAL}) > 8192) {
+    Log3($hash, 1, "KLF200 ($name) Receive buffer overflow, discarding ".length($hash->{PARTIAL})." bytes");
+    $hash->{PARTIAL} = "";
+    KLF200_CountFrameError($hash);
+    return;
+  }
+
+  while (1) {
+    # discard anything in front of the first SLIP_END
+    my $start = index($hash->{PARTIAL}, "\xC0");
+    if ($start < 0) { $hash->{PARTIAL} = ""; last };
+    if ($start > 0) {
+      Log3($hash, 3, "KLF200 ($name) Skipped $start bytes in front of frame start");
+      KLF200_CountFrameError($hash);
+      $hash->{PARTIAL} = substr($hash->{PARTIAL}, $start);
+    }
+    # a sender may use SLIP_END as terminator and starter: skip empty frames
+    if (substr($hash->{PARTIAL}, 1, 1) eq "\xC0") {
+      $hash->{PARTIAL} = substr($hash->{PARTIAL}, 1);
+      next;
+    }
+    my $end = index($hash->{PARTIAL}, "\xC0", 1);
+    last if ($end < 0); #frame is not complete yet, wait for the next read
+
+    my $frame = substr($hash->{PARTIAL}, 0, $end + 1);
+    $hash->{PARTIAL} = substr($hash->{PARTIAL}, $end + 1);
+
+    my $bytes = KLF200_UnwrapBytes($hash, $frame);
+    KLF200_DispatchFrame($hash, $bytes) if(defined($bytes));
+  }
+  return;
+}
+
+# called for every complete and valid frame
+sub KLF200_DispatchFrame($$) {
+  my ($hash, $bytes) = @_;
+  my $name = $hash->{NAME};
+
   my $hexString = unpack("H*", $bytes); 
   Log3($hash, 5, "KLF200 ($name) - received: $hexString"); 
   
@@ -218,9 +262,18 @@ sub KLF200_Read($) {
   elsif ($command =~ /^(\x01\x01|\x02\x03|\x03\x06|\x03\x13|\x05\x06)$/)
                                  { Log3($hash, 5, "KLF200 ($name) - ignored:  $hexString") }
   else                           { Log3($hash, 1, "KLF200 ($name) - unknown:  $hexString") }     
+  return;
 }
 
-# called if set command is executed
+sub KLF200_CountFrameError($) {
+  my ($hash) = @_;
+  my $name = $hash->{NAME};
+
+  my $frameErrors = ReadingsVal($name, "frameErrors", 0) + 1;
+  readingsSingleUpdate($hash, "frameErrors", $frameErrors, 1);
+  return;
+}
+
 sub KLF200_Set($$$) {
   my ($hash, $argsref, undef) = @_;
   my @a= @{$argsref};
@@ -253,6 +306,7 @@ sub KLF200_Set($$$) {
 sub KLF200_Init($) {
     my ($hash) = @_;
 
+    $hash->{PARTIAL} = "";
     KLF200_login($hash, undef);
     
     return undef; 
@@ -317,26 +371,55 @@ sub KLF200_WrapBytes($$) {
   return $bytes;
 }
 
+# expects exactly one complete SLIP frame including both SLIP_END bytes
 sub KLF200_UnwrapBytes($$) {
-  my ($hash, $bytes) = @_;
+  my ($hash, $frame) = @_;
   my $name = $hash->{NAME};
 
-  my $hexString = unpack("H*", $bytes);  
-  if ("\xC0\x00" ne substr($bytes, 0, 2) or
-     ("\xC0" ne substr($bytes, length($bytes) - 1, 1))) {
+  my $hexString = unpack("H*", $frame);  
+  if ((length($frame) < 7)
+    or ("\xC0" ne substr($frame, 0, 1))
+    or ("\xC0" ne substr($frame, length($frame) - 1, 1))) {
     Log3($hash, 1, "KLF200 ($name) No SLIP protocol: $hexString");
+    KLF200_CountFrameError($hash);
     return undef;
   }
-  $bytes = substr($bytes, 2, length($bytes) - 3); #remove SLIP_END and ProtocolID
+  #remove leading and trailing SLIP_END, then undo the escaping
+  my $bytes = substr($frame, 1, length($frame) - 2);
   $bytes =~ s/\xDB\xDC/\xC0/g;        #replace SLIP_ESC SLIP_ESC_END by SLIP_END
   $bytes =~ s/\xDB\xDD/\xDB/g;        #replace SLIP_ESC SLIP_ESC_ESC by SLIP_ESC
-  
-  $bytes = substr($bytes, 0, length($bytes) - 1); #cut CRC
+
+  #the frame is ProtocolID(1) Length(1) Command(2) Data(n) CheckSum(1)
+  if (length($bytes) < 5) {
+    Log3($hash, 1, "KLF200 ($name) Frame too short: $hexString");
+    KLF200_CountFrameError($hash);
+    return undef;
+  }
+  my $ProtocolID = unpack("C", substr($bytes, 0, 1));
+  if ($ProtocolID != 0) {
+    Log3($hash, 1, "KLF200 ($name) Unknown ProtocolID $ProtocolID: $hexString");
+    KLF200_CountFrameError($hash);
+    return undef;
+  }
+
+  my $CheckSumReceived = unpack("C", substr($bytes, length($bytes) - 1, 1));
+  my $CheckSumExpected = 0;
+  $CheckSumExpected ^= $_ for unpack('C*', substr($bytes, 0, length($bytes) - 1));
+  if ($CheckSumReceived != $CheckSumExpected) {
+    Log3($hash, 1, "KLF200 ($name) Invalid checksum: expected $CheckSumExpected received $CheckSumReceived, frame discarded");
+    Log3($hash, 1, "KLF200 ($name) Invalid checksum: $hexString");
+    KLF200_CountFrameError($hash);
+    return undef;
+  }
+  $bytes = substr($bytes, 1, length($bytes) - 2); #cut ProtocolID and CheckSum
+
   my $expLength = unpack('C', substr($bytes, 0, 1));
   my $actLength = length($bytes);
   if ($expLength != $actLength ) {
-    Log3($hash, 1, "KLF200 ($name) Invalid length: expected $expLength received $actLength bytes, trying to decode anyway");
+    Log3($hash, 1, "KLF200 ($name) Invalid length: expected $expLength received $actLength bytes, frame discarded");
     Log3($hash, 1, "KLF200 ($name) Invalid length: $hexString");
+    KLF200_CountFrameError($hash);
+    return undef;
   }
   $bytes = substr($bytes, 1); #cut length
 
@@ -558,6 +641,7 @@ sub KLF200_connectionBroken($) {
   if (ReadingsVal($name, "connectionBroken", 0) == 1) { return; };
   
   DevIo_CloseDev($hash);
+  $hash->{PARTIAL} = "";
   Log3($hash, 1, "KLF200 ($name) - connectionBroken -> closed connection");
   
   readingsBeginUpdate($hash);
@@ -926,6 +1010,7 @@ sub KLF200_GW_REBOOT_CFM($$) {
   Log3($hash, 5, "KLF200 ($name) GW_REBOOT_CFM $commandHex");
 
   DevIo_CloseDev($hash);  
+  $hash->{PARTIAL} = "";
   InternalTimer( gettimeofday() + 30, "KLF200_Ready", $hash); #Try to reconnect in 30 seconds
   readingsBeginUpdate($hash);
   readingsBulkUpdate($hash, "state", "Reboot", 1);
@@ -1090,6 +1175,15 @@ sub KLF200_GW_ERROR_NTF($$) {
         <br>
     </li>
     <li><a href="#readingFnAttributes">readingFnAttributes</a></li>
+  </ul><br>
+  <a name="KLF200readings"></a>
+  <b>Readings</b><br><br>
+  <ul>
+    <li>frameErrors<br>
+        Number of received frames that were discarded because of a broken SLIP structure, a wrong protocol id,
+        a wrong length or a wrong checksum. A permanently rising value points to a problem on the connection.<br>
+        <br>
+    </li>
   </ul>
   <br><br>
 
