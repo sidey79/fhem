@@ -311,6 +311,7 @@ sub KLF200_Init($) {
     my ($hash) = @_;
 
     $hash->{PARTIAL} = "";
+    delete($hash->{".queueRetry"});
     KLF200_login($hash, undef);
     
     return undef; 
@@ -438,8 +439,10 @@ sub KLF200_Write($$) {
   my $name = $hash->{NAME};
 
   my $queue = $hash->{".queue"};
-  if (grep { $_ eq $bytes } @$queue) {
-    Log3 ($name, 1, "KLF200 ($name) Command skipped, already in queue");
+  #Only skip an immediate repetition of the very same request. Scanning the
+  #whole queue used to swallow user commands while the queue was stuck.
+  if ((scalar(@$queue) > 0) and (@$queue[scalar(@$queue) - 1] eq $bytes)) {
+    Log3 ($hash, 4, "KLF200 ($name) Command skipped, identical request already queued");
     return;
   }
   push (@$queue, $bytes);
@@ -474,25 +477,88 @@ sub KLF200_Dequeue($$$) {
   my $name = $hash->{NAME};
   my $queue = $hash->{".queue"};
 
-  Log3 ($name, 5, "KLF200 ($name) Dequeue: regex = $regex") if (defined($regex));
-  Log3 ($name, 5, "KLF200 ($name) Dequeue: SessionID = $SessionID") if (defined($SessionID));
+  Log3 ($hash, 5, "KLF200 ($name) Dequeue: regex = $regex") if (defined($regex));
+  Log3 ($hash, 5, "KLF200 ($name) Dequeue: SessionID = $SessionID") if (defined($SessionID));
   if (scalar(@$queue) == 0) { return };
-  Log3 ($name, 5, "KLF200 ($name) Dequeue: " . unpack("H*", @$queue[0]));
+  Log3 ($hash, 5, "KLF200 ($name) Dequeue: " . unpack("H*", @$queue[0]));
   if (defined($regex) and not (@$queue[0] =~ m/$regex/)) { return };
   if (defined($SessionID) and (pack("n", $SessionID) ne substr(@$queue[0], 2, 2))) { return };
   shift(@$queue);
-  Log3 ($name, 5, "KLF200 ($name) Dequeue: mached");
+  delete($hash->{".queueRetry"});
+  Log3 ($hash, 5, "KLF200 ($name) Dequeue: mached");
   readingsSingleUpdate($hash, "queueSize", scalar(@$queue), 1);
   KLF200_RunQueue($hash)
 }
 
 sub KLF200_RunQueue($) {
   my ($hash) = @_;
+  my $name = $hash->{NAME};
   my $queue = $hash->{".queue"};
-  
-  if (scalar(@$queue) > 0) {
-    KLF200_WriteDirect($hash, @$queue[0]);
+
+  RemoveInternalTimer($hash, "KLF200_QueueTimeout");
+  if (scalar(@$queue) == 0) {
+    delete($hash->{".queueRetry"});
+    return;
   }
+  #Pause the queue while there is no session, it is resumed after the next login
+  if ((ReadingsVal($name, "state", "") ne "Logged in") or (not defined($hash->{TCPDev}))) {
+    Log3 ($hash, 4, "KLF200 ($name) Queue paused, not logged in");
+    return;
+  }
+  my $bytes = @$queue[0];
+  KLF200_WriteDirect($hash, $bytes);
+  InternalTimer( gettimeofday() + KLF200_GetQueueTimeout($bytes), "KLF200_QueueTimeout", $hash);
+  return;
+}
+
+#How long the head of the queue may wait for the frame that dequeues it
+sub KLF200_GetQueueTimeout($) {
+  my ($bytes) = @_;
+  my $command = substr($bytes, 0, 2);
+
+  return 90 if ($command eq "\x04\x12");                        #GW_ACTIVATE_SCENE_REQ, waits for GW_SESSION_FINISHED_NTF
+  return 60 if ($command =~ /^(\x03\x05|\x03\x12|\x03\x10)$/);  #status, get/set limitation, wait for GW_SESSION_FINISHED_NTF
+  return 60 if ($command eq "\x02\x02");                        #GW_GET_ALL_NODES_INFORMATION_REQ
+  return 30 if ($command eq "\x00\x01");                        #GW_REBOOT_REQ
+  return 10;                                                    #everything else is confirmed immediately
+}
+
+#Requests that change something must never be repeated: if the confirmation got
+#lost the box has most likely executed the request anyway.
+sub KLF200_IsQueueRetryable($) {
+  my ($bytes) = @_;
+  my $command = substr($bytes, 0, 2);
+
+  return 0 if ($command =~ /^(\x03\x00|\x04\x12|\x03\x10|\x00\x01)$/);
+  return 1;
+}
+
+sub KLF200_QueueTimeout($) {
+  my ($hash) = @_;
+  my $name = $hash->{NAME};
+  my $queue = $hash->{".queue"};
+
+  if (scalar(@$queue) == 0) { return };
+  my $bytes = @$queue[0];
+  my $hexString = unpack("H*", $bytes);
+
+  my $queueTimeouts = ReadingsVal($name, "queueTimeouts", 0) + 1;
+  readingsSingleUpdate($hash, "queueTimeouts", $queueTimeouts, 1);
+
+  my $retry = $hash->{".queueRetry"};
+  $retry = 0 if (not defined($retry));
+  if (KLF200_IsQueueRetryable($bytes) and ($retry < 1)) {
+    $hash->{".queueRetry"} = $retry + 1;
+    Log3 ($hash, 1, "KLF200 ($name) Queue timeout, request repeated once: $hexString");
+    KLF200_RunQueue($hash);
+    return;
+  }
+  Log3 ($hash, 1, "KLF200 ($name) Queue timeout, request dropped: $hexString");
+  shift(@$queue);
+  delete($hash->{".queueRetry"});
+  readingsSingleUpdate($hash, "queueSize", scalar(@$queue), 1);
+  KLF200_RunQueue($hash);
+  return;
 }
 
 sub KLF200_ClearQueue($) {
@@ -500,8 +566,10 @@ sub KLF200_ClearQueue($) {
   my $name = $hash->{NAME};
   my $queue = $hash->{".queue"};
   
+  RemoveInternalTimer($hash, "KLF200_QueueTimeout");
   @$queue = ();
-  Log3 ($name, 3, "KLF200 ($name) Queue cleared");
+  delete($hash->{".queueRetry"});
+  Log3 ($hash, 3, "KLF200 ($name) Queue cleared");
   readingsSingleUpdate($hash, "queueSize", scalar(@$queue), 1);
   return;
 }
@@ -652,6 +720,7 @@ sub KLF200_connectionBroken($) {
   #power cycle helps.
   KLF200_GW_HOUSE_STATUS_MONITOR_DISABLE_REQ($hash, 0);
 
+  RemoveInternalTimer($hash, "KLF200_QueueTimeout");
   DevIo_CloseDev($hash);
   $hash->{PARTIAL} = "";
   Log3($hash, 1, "KLF200 ($name) - connectionBroken -> closed connection");
@@ -795,15 +864,10 @@ sub KLF200_GW_GET_STATE_CFM($$) {
   if (($GatewayState == 2) or ($GatewayState == 1)) {
     my $SubStateStr = KLF200_GetText($hash, "SubState", $SubState);
     readingsSingleUpdate($hash, "subState", $SubStateStr, 1);
-    
-    my $queueSize = ReadingsVal($name, "queueSize", 0);    
-    if ($queueSize > 0) {
-      #If the queue is not empty: Remove first request from the queue and run the queue.
-      #This should never happen, just to be on the safe side.
-      Log3($hash, 1, "KLF200 ($name) GW_GET_STATE_CFM Queue is not empty! Run queue again. queueSize $queueSize subState $SubStateStr");
-      KLF200_Dequeue($hash, undef, undef);
-    }
   }  
+  #A queue that does not move is handled by KLF200_QueueTimeout, which knows how
+  #long each request may legitimately take. Forcing a dequeue here would abort
+  #long running sessions such as a scene.
   return;
 }
 
@@ -1043,6 +1107,7 @@ sub KLF200_GW_REBOOT_CFM($$) {
   my ($commandHex) = unpack("H4", $bytes);
   Log3($hash, 5, "KLF200 ($name) GW_REBOOT_CFM $commandHex");
 
+  RemoveInternalTimer($hash, "KLF200_QueueTimeout");
   DevIo_CloseDev($hash);  
   $hash->{PARTIAL} = "";
   InternalTimer( gettimeofday() + 30, "KLF200_Ready", $hash); #Try to reconnect in 30 seconds
@@ -1215,6 +1280,11 @@ sub KLF200_GW_ERROR_NTF($$) {
   <a name="KLF200readings"></a>
   <b>Readings</b><br><br>
   <ul>
+    <li>queueTimeouts<br>
+        Number of requests whose confirmation did not arrive in time. Such a request is repeated once if it does
+        not move an actuator, otherwise it is dropped, and the queue continues in both cases.<br>
+        <br>
+    </li>
     <li>frameErrors<br>
         Number of received frames that were discarded because of a broken SLIP structure, a wrong protocol id,
         a wrong length or a wrong checksum. A permanently rising value points to a problem on the connection.<br>
