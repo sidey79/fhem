@@ -202,6 +202,9 @@ sub KLF200_Read($) {
   # frame, exactly one frame or several frames. Collect everything in PARTIAL
   # and cut out each complete SLIP frame, keep the remainder for the next read.
   $hash->{PARTIAL} = "" if(not defined($hash->{PARTIAL}));
+  #A leftover from the previous read means the frame that completes now was
+  #split across reads - the second way the stream can break a naive parser
+  my $carriedOver = length($hash->{PARTIAL});
   $hash->{PARTIAL} .= $buf;
 
   if (length($hash->{PARTIAL}) > 8192) {
@@ -211,6 +214,7 @@ sub KLF200_Read($) {
     return;
   }
 
+  my $frameCount = 0;
   while (1) {
     # discard anything in front of the first SLIP_END
     my $start = index($hash->{PARTIAL}, "\xC0");
@@ -231,8 +235,30 @@ sub KLF200_Read($) {
     my $frame = substr($hash->{PARTIAL}, 0, $end + 1);
     $hash->{PARTIAL} = substr($hash->{PARTIAL}, $end + 1);
 
+    $frameCount++;
     my $bytes = KLF200_UnwrapBytes($hash, $frame);
     KLF200_DispatchFrame($hash, $bytes) if(defined($bytes));
+  }
+  KLF200_CountFrames($hash, $frameCount, $carriedOver);
+  return;
+}
+
+#Diagnostics: how the box actually distributes its frames over the stream.
+#maxFramesPerRead staying at 1 means every frame arrived on its own, so this
+#installation would never have hit the old one-frame-per-read assumption.
+sub KLF200_CountFrames($$$) {
+  my ($hash, $frameCount, $carriedOver) = @_;
+  my $name = $hash->{NAME};
+
+  return if ($frameCount == 0);
+
+  if ($frameCount > ReadingsVal($name, "maxFramesPerRead", 0)) {
+    readingsSingleUpdate($hash, "maxFramesPerRead", $frameCount, 1);
+  }
+  if ($carriedOver > 0) {
+    my $framesReassembled = ReadingsVal($name, "framesReassembled", 0) + 1;
+    readingsSingleUpdate($hash, "framesReassembled", $framesReassembled, 1);
+    Log3($hash, 4, "KLF200 ($name) Frame completed from $carriedOver buffered plus new bytes");
   }
   return;
 }
@@ -1316,6 +1342,15 @@ sub KLF200_GW_ERROR_NTF($$) {
   <a name="KLF200readings"></a>
   <b>Readings</b><br><br>
   <ul>
+    <li>maxFramesPerRead<br>
+        Highest number of complete frames that arrived in a single read. A value of 1 means the box sends every
+        frame on its own, a higher value means it bundles them and the stream has to be reassembled.<br>
+        <br>
+    </li>
+    <li>framesReassembled<br>
+        Number of frames that did not fit into a single read and had to be assembled from the buffer.<br>
+        <br>
+    </li>
     <li>queueTimeouts<br>
         Number of requests whose confirmation did not arrive in time. Such a request is repeated once if it does
         not move an actuator, otherwise it is dropped, and the queue continues in both cases.<br>

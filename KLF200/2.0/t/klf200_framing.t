@@ -4,7 +4,7 @@
 package main;
 use strict;
 use warnings;
-use Test::More tests => 17;
+use Test::More tests => 24;
 use FindBin;
 use lib "$FindBin::Bin/stub";
 
@@ -136,3 +136,24 @@ is_deeply(\@got, ["03040005"], "leading garbage is skipped, frame still found");
 $hash = new_hash();
 @got = read_chunks($hash, build_frame("\x03\x04\x00\x06") . "\xC0" . build_frame("\x03\x04\x00\x07"));
 is_deeply(\@got, ["03040006", "03040007"], "extra SLIP_END between frames is tolerated");
+
+# ---------------------------------------------------------------- 18. diagnostics
+$hash = new_hash();
+read_chunks($hash, build_frame("\x03\x04\x00\x08"));
+is(ReadingsVal("KLF","maxFramesPerRead",0), 1, "one frame per read is recorded as 1");
+is(ReadingsVal("KLF","framesReassembled",0), 0, "nothing was reassembled");
+
+$hash = new_hash();
+read_chunks($hash, join("", map { build_frame("\x03\x04".pack("n",$_)) } (1,2,3)));
+is(ReadingsVal("KLF","maxFramesPerRead",0), 3, "three frames in one read are recorded as 3");
+is(ReadingsVal("KLF","framesReassembled",0), 0, "bundling is not counted as reassembly");
+
+$hash = new_hash();
+$f = build_frame("\x03\x04\x00\x09");
+read_chunks($hash, substr($f,0,4), substr($f,4));
+is(ReadingsVal("KLF","framesReassembled",0), 1, "a frame split over two reads is counted");
+is(ReadingsVal("KLF","maxFramesPerRead",0), 1, "the split frame still counts as one frame");
+
+$hash = new_hash();
+read_chunks($hash, substr(build_frame("\x03\x04\x00\x0A"),0,4));
+is(ReadingsVal("KLF","maxFramesPerRead",0), 0, "a read without any complete frame records nothing");
